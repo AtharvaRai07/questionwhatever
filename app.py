@@ -47,7 +47,6 @@ def execute_python_code(code: str) -> dict:
         sys.stdout = stdout_buffer
         sys.stderr = stderr_buffer
 
-        # Compile separately so syntax errors retain their line number.
         compiled_code = compile(code, "<string>", "exec")
         exec(compiled_code, {})
 
@@ -74,17 +73,18 @@ def analyze_error_with_ai(code: str, error_traceback: str) -> list[int]:
         raise RuntimeError("AIPIPE_TOKEN environment variable is not set")
 
     prompt = f"""
-Analyze the Python code and traceback below.
-Return the exact line number(s) in the submitted code responsible
-for the error. Use the line number shown in the traceback.
-Return only JSON matching this schema:
-{{"error_lines": [3]}}
+Analyze the Python code and traceback.
+Identify only the line number(s) in the submitted code that caused
+the error. Do not include lines from the server or Python libraries.
 
 CODE:
 {code}
 
 TRACEBACK:
 {error_traceback}
+
+Return JSON only in this format:
+{{"error_lines": [3]}}
 """
 
     response = httpx.post(
@@ -99,9 +99,9 @@ TRACEBACK:
                 {
                     "role": "system",
                     "content": (
-                        "You identify Python error line numbers. "
                         "Return valid JSON with an error_lines array "
-                        "of integers. Do not invent line numbers."
+                        "containing only line numbers from the submitted "
+                        "Python code. Exclude server and library lines."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -116,6 +116,21 @@ TRACEBACK:
     return ErrorAnalysis.model_validate_json(content).error_lines
 
 
+def get_traceback_line_numbers(output: str) -> list[int]:
+    lines = []
+
+    for line in output.splitlines():
+        marker = 'File "<string>", line '
+        if marker in line:
+            try:
+                number = int(line.split(marker, 1)[1].split(",", 1)[0])
+                lines.append(number)
+            except ValueError:
+                continue
+
+    return lines
+
+
 @app.post("/code-interpreter")
 def code_interpreter(request: CodeRequest):
     execution = execute_python_code(request.code)
@@ -128,22 +143,22 @@ def code_interpreter(request: CodeRequest):
             request.code, execution["output"]
         )
     except Exception:
-        # Fallback: recover the line number from Python's traceback.
-        # This keeps the endpoint usable if the AI service is unavailable.
-        error_lines = []
-        for line in execution["output"].splitlines():
-            if 'line ' in line and ', in ' in line:
-                try:
-                    error_lines.append(
-                        int(line.split('line ')[1].split(',')[0])
-                    )
-                except ValueError:
-                    pass
+        error_lines = get_traceback_line_numbers(execution["output"])
 
-        if not error_lines:
-            error_lines = [1]
+    # Keep only valid line numbers from the submitted code.
+    valid_lines = set(range(1, len(request.code.splitlines()) + 1))
+    error_lines = sorted({
+        line for line in error_lines
+        if line in valid_lines
+    })
 
-    return {"error": error_lines, "result": execution["output"]}
+    if not error_lines:
+        error_lines = get_traceback_line_numbers(execution["output"])
+
+    return {
+        "error": error_lines,
+        "result": execution["output"],
+    }
 
 
 if __name__ == "__main__":
